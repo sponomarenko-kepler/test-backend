@@ -48,7 +48,7 @@ jobs:
       - name: Fetch parameters, set as step outputs using environment files, and print them
         id: set_params
         run: |
-          parameters=$(aws ssm get-parameters-by-path --path "/${{ steps.step1.outputs.DEPLOYMENT_ENVIRONMENT }}/" --recursive --with-decryption --query "Parameters[].[Name,Value]" --output text)
+          parameters=$(aws ssm get-parameters-by-path --path "/${{ vars.PROJECT }}/${{ steps.step1.outputs.DEPLOYMENT_ENVIRONMENT }}/" --recursive --with-decryption --query "Parameters[].[Name,Value]" --output text)
           echo "Setting outputs and printing variables:"
           while IFS=$'\t' read -r name value; do
             name=$(echo $name | sed 's|/${{ vars.PROJECT }}/${{ steps.step1.outputs.DEPLOYMENT_ENVIRONMENT }}/||') # Strip the initial part of the parameter name
