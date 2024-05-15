@@ -1,0 +1,138 @@
+name: API Pipeline
+
+on:
+  push:
+    tags:
+      - 'v*.*.*-rc*'
+      - 'v*.*.*'
+    branches:
+      - 'main'
+
+jobs:
+  setDeployEnv:
+    runs-on: ubuntu-latest
+    outputs:
+      deploy_env: ${{ steps.step1.outputs.DEPLOYMENT_ENVIRONMENT }}
+      deploy_ver: ${{ steps.step1.outputs.DEPLOYMENT_VERSION }}
+      api_ecr_repository_url: ${{ steps.set_params.outputs.API_ECR_REPOSITORY_URL }}
+      api_ecs_service_name: ${{ steps.set_params.outputs.API_ECS_SERVICE_NAME }}
+      ecs_cluster_name: ${{ steps.set_params.outputs.ECS_CLUSTER_NAME }}
+
+    steps:
+      - name: Extract environment and version
+        id: step1
+        run: |
+          if [[ $GITHUB_REF == refs/tags/v*.*.*-rc* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+            echo $VERSION
+            ENVIRONMENT=staging
+          elif [[ $GITHUB_REF == refs/tags/v*.*.* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+            echo $VERSION
+            ENVIRONMENT=prod
+          elif [[ $GITHUB_REF == refs/heads/main ]]; then
+            ENVIRONMENT=develop
+            VERSION=${{ github.sha }}
+          else
+            echo "Unsupported deployment trigger"
+            exit 1
+          fi
+          echo "DEPLOYMENT_ENVIRONMENT=$ENVIRONMENT" >> $GITHUB_OUTPUT
+          echo "DEPLOYMENT_VERSION=$VERSION" >> $GITHUB_OUTPUT
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+      - name: Fetch parameters, set as step outputs using environment files, and print them
+        id: set_params
+        run: |
+          parameters=$(aws ssm get-parameters-by-path --path "/${{ steps.step1.outputs.DEPLOYMENT_ENVIRONMENT }}/" --recursive --with-decryption --query "Parameters[].[Name,Value]" --output text)
+          echo "Setting outputs and printing variables:"
+          while IFS=$'\t' read -r name value; do
+            name=$(echo $name | sed 's|/${{ vars.PROJECT }}/${{ steps.step1.outputs.DEPLOYMENT_ENVIRONMENT }}/||') # Strip the initial part of the parameter name
+            name=$(echo $name | sed 's|[^a-zA-Z0-9_]|_|g') # Ensure the name is a valid environment variable
+            # Print the variable and its value
+            echo "Output set: $name=$value"
+            echo "$name=$value" >> $GITHUB_OUTPUT
+          done <<< "$parameters"
+
+      - name: "Output current environemnt"
+        run: |
+          echo "Current environment: ${{ steps.step1.outputs.DEPLOYMENT_ENVIRONMENT }}"
+          echo "Current environment: ${{ steps.step1.outputs.DEPLOYMENT_ENVIRONMENT }}"
+  
+  # test:
+  #   runs-on: ubuntu-latest
+  #   needs: setDeployEnv
+  #   steps:
+  #   - name: Install dependencies
+  #     run: npm ci
+
+  #   - name: Run tests
+  #     run: npm test
+  #     env:
+  #       CI: true
+
+  build:
+    runs-on: ubuntu-latest
+    needs: setDeployEnv
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Build, tag, and push docker image to Amazon ECR
+      id: build-image
+      env:
+        ECR_REPOSITORY: ${{ needs.setDeployEnv.outputs.api_ecr_repository_url }}
+        IMAGE_TAG: ${{ needs.setDeployEnv.outputs.deploy_ver }}
+      run: |
+        docker build -t $ECR_REPOSITORY:$IMAGE_TAG .
+        docker push $ECR_REPOSITORY:$IMAGE_TAG
+        echo "image=$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT    
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: 
+    - setDeployEnv
+    - build
+    steps:
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+        
+    - name: Download task definition
+      run: |
+        aws ecs describe-task-definition --task-definition api-${{ needs.setDeployEnv.outputs.deploy_env }} --query taskDefinition > task-definition.json
+      
+    
+    - name: Fill in the new image ID in the Amazon ECS task definition
+      id: task-def
+      uses: aws-actions/amazon-ecs-render-task-definition@v1
+      with:
+        task-definition: task-definition.json
+        container-name: api
+        image: "${{ needs.setDeployEnv.outputs.api_ecr_repository_url }}:${{ needs.setDeployEnv.outputs.deploy_ver }}"
+    
+    - name: Deploy Amazon ECS task definition
+      uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+      with:
+        task-definition: ${{ steps.task-def.outputs.task-definition }}
+        service: ${{ needs.setDeployEnv.outputs.api_ecs_service_name }}
+        cluster: ${{ needs.setDeployEnv.outputs.ecs_cluster_name }}
+        wait-for-service-stability: true
